@@ -1,10 +1,22 @@
 import numpy
 import tensorflow as tf
+import time
+from datetime import datetime
 from tensorflow.python import keras
 from tensorflow.python.keras.models import Sequential
 from tensorflow.python.keras.layers import Dense, Dropout
-from tensorflow.python.keras.optimizers import RMSprop
 from tensorflowonspark import TFNode
+
+
+class StopFeedHook(tf.train.SessionRunHook):
+  """SessionRunHook to terminate InputMode.SPARK RDD feeding if the training loop exits before the entire RDD is consumed."""
+
+  def __init__(self, tf_feed):
+    self._tf_feed = tf_feed
+
+  def end(self, session):
+    self._tf_feed.terminate()
+    self._tf_feed.next_batch(1)
 
 
 def main_fun(args, ctx):
@@ -31,90 +43,83 @@ def main_fun(args, ctx):
   model.add(Dropout(0.2))
   model.add(Dense(10, activation='softmax'))
   model.compile(loss='categorical_crossentropy',
-                optimizer=RMSprop(),
+                optimizer=tf.train.RMSPropOptimizer(learning_rate=0.001),
                 metrics=['accuracy'])
   model.summary()
+
+  print("model.inputs: {}".format(model.inputs))
+  print("model.outputs: {}".format(model.outputs))
 
   # convert Keras model to tf.estimator
   estimator = tf.keras.estimator.model_to_estimator(model, model_dir=args.model_dir)
 
   # setup train_input_fn for InputMode.TENSORFLOW or InputMode.SPARK
-  if args.mode == 'train':
-    if args.input_mode == 'tf':
-      # For InputMode.TENSORFLOW, just use data in memory
-      train_input_fn = tf.estimator.inputs.numpy_input_fn(
-          x={"dense_1_input": x_train},
-          y=y_train,
-          batch_size=128,
-          num_epochs=None,
-          shuffle=True)
-    else:  # 'spark'
-      # For InputMode.SPARK, read data from RDD
-      tf_feed = TFNode.DataFeed(ctx.mgr)
-
-      def rdd_generator():
-        while not tf_feed.should_stop():
-          batch = tf_feed.next_batch(1)
-          if len(batch) > 0:
-            record = batch[0]
-            image = numpy.array(record[0]).astype(numpy.float32) / 255.0
-            label = numpy.array(record[1]).astype(numpy.float32)
-            yield (image, label)
-
-      def train_input_fn():
-        ds = tf.data.Dataset.from_generator(rdd_generator,
-                                            (tf.float32, tf.float32),
-                                            (tf.TensorShape([IMAGE_PIXELS * IMAGE_PIXELS]), tf.TensorShape([10])))
-        ds = ds.batch(args.batch_size)
-        return ds
-
-    # eval_input_fn ALWAYS uses data loaded in memory, since InputMode.SPARK can only feed one RDD at a time
-    eval_input_fn = tf.estimator.inputs.numpy_input_fn(
-        x={"dense_1_input": x_test},
-        y=y_test,
+  if args.input_mode == 'tf':
+    # For InputMode.TENSORFLOW, just use data in memory
+    train_input_fn = tf.estimator.inputs.numpy_input_fn(
+        x={"dense_input": x_train},
+        y=y_train,
+        batch_size=128,
         num_epochs=args.epochs,
-        shuffle=False)
+        shuffle=True)
 
-    # serving_input_receiver_fn ALWAYS expects serialized TFExamples in a placeholder.
-    def serving_input_receiver_fn():
-      """An input receiver that expects a serialized tf.Example."""
-      serialized_tf_example = tf.placeholder(dtype=tf.string,
-                                             shape=[args.batch_size],
-                                             name='input_example_tensor')
-      receiver_tensors = {'dense_1_input': serialized_tf_example}
-      feature_spec = {'dense_1_input': tf.FixedLenFeature(784, tf.string)}
-      features = tf.parse_example(serialized_tf_example, feature_spec)
-      return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
+    hooks = []
+  else:  # 'spark'
+    # For InputMode.SPARK, read data from RDD
+    tf_feed = TFNode.DataFeed(ctx.mgr)
 
-    # setup tf.estimator.train_and_evaluate() w/ FinalExporter
-    exporter = tf.estimator.FinalExporter("serving", serving_input_receiver_fn=serving_input_receiver_fn)
-    train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=args.steps)
-    eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, exporters=exporter)
-    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+    def rdd_generator():
+      while not tf_feed.should_stop():
+        batch = tf_feed.next_batch(1)
+        if len(batch) > 0:
+          record = batch[0]
+          image = numpy.array(record[0]).astype(numpy.float32) / 255.0
+          label = numpy.array(record[1]).astype(numpy.float32)
+          yield (image, label)
+        else:
+          return
 
-  else:  # mode == 'inference'
-    if args.input_mode == 'spark':
-      tf_feed = TFNode.DataFeed(ctx.mgr)
+    def train_input_fn():
+      ds = tf.data.Dataset.from_generator(rdd_generator,
+                                          (tf.float32, tf.float32),
+                                          (tf.TensorShape([IMAGE_PIXELS * IMAGE_PIXELS]), tf.TensorShape([10])))
+      ds = ds.batch(args.batch_size)
+      return ds
 
-      def rdd_generator():
-        while not tf_feed.should_stop():
-          batch = tf_feed.next_batch(1)
-          if len(batch) > 0:
-            record = batch[0]
-            image = numpy.array(record[0]).astype(numpy.float32) / 255.0
-            label = numpy.array(record[1]).astype(numpy.float32)
-            yield (image, label)
+    # add a hook to terminate the RDD data feed when the session ends
+    hooks = [StopFeedHook(tf_feed)]
 
-      def predict_input_fn():
-        ds = tf.data.Dataset.from_generator(rdd_generator,
-                                            (tf.float32, tf.float32),
-                                            (tf.TensorShape([IMAGE_PIXELS * IMAGE_PIXELS]), tf.TensorShape([10])))
-        ds = ds.batch(args.batch_size)
-        return ds
+  # eval_input_fn ALWAYS uses data loaded in memory, since InputMode.SPARK can only feed one RDD at a time
+  eval_input_fn = tf.estimator.inputs.numpy_input_fn(
+      x={"dense_input": x_test},
+      y=y_test,
+      num_epochs=1,
+      shuffle=False)
 
-      predictions = estimator.predict(predict_input_fn)
-      for result in predictions:
-        tf_feed.batch_results([result])
+  # setup tf.estimator.train_and_evaluate() w/ FinalExporter
+  feature_spec = {'dense_input': tf.placeholder(tf.float32, shape=[None, 784])}
+  exporter = tf.estimator.FinalExporter("serving", serving_input_receiver_fn=tf.estimator.export.build_raw_serving_input_receiver_fn(feature_spec))
+  train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=args.steps, hooks=hooks)
+  eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, exporters=exporter)
+
+  # train and export model
+  tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
+  # WORKAROUND FOR https://github.com/tensorflow/tensorflow/issues/21745
+  # wait for all other nodes to complete (via done files)
+  done_dir = "{}/done".format(ctx.absolute_path(args.model_dir))
+  print("Writing done file to: {}".format(done_dir))
+  tf.gfile.MakeDirs(done_dir)
+  with tf.gfile.GFile("{}/{}".format(done_dir, ctx.task_index), 'w') as done_file:
+    done_file.write("done")
+
+  for i in range(60):
+    if len(tf.gfile.ListDirectory(done_dir)) < len(ctx.cluster_spec['worker']):
+      print("{} Waiting for other nodes {}".format(datetime.now().isoformat(), i))
+      time.sleep(1)
+    else:
+      print("{} All nodes done".format(datetime.now().isoformat()))
+      break
 
 
 if __name__ == '__main__':
@@ -126,18 +131,15 @@ if __name__ == '__main__':
   sc = SparkContext(conf=SparkConf().setAppName("mnist_mlp"))
   executors = sc._conf.get("spark.executor.instances")
   num_executors = int(executors) if executors is not None else 1
-  num_ps = 1
 
   parser = argparse.ArgumentParser()
   parser.add_argument("--batch_size", help="number of records per batch", type=int, default=100)
   parser.add_argument("--cluster_size", help="number of nodes in the cluster", type=int, default=num_executors)
-  parser.add_argument("--epochs", help="number of epochs of training data", type=int, default=1)
-  parser.add_argument("--export_dir", help="directory to export saved_model")
+  parser.add_argument("--epochs", help="number of epochs of training data", type=int, default=None)
   parser.add_argument("--images", help="HDFS path to MNIST images in parallelized CSV format")
   parser.add_argument("--input_mode", help="input mode (tf|spark)", default="tf")
   parser.add_argument("--labels", help="HDFS path to MNIST labels in parallelized CSV format")
   parser.add_argument("--model_dir", help="directory to write model checkpoints")
-  parser.add_argument("--mode", help="(train|inference")
   parser.add_argument("--output", help="HDFS path to save test/inference output", default="predictions")
   parser.add_argument("--num_ps", help="number of ps nodes", type=int, default=1)
   parser.add_argument("--steps", help="max number of steps to train", type=int, default=2000)
@@ -155,14 +157,6 @@ if __name__ == '__main__':
     images = sc.textFile(args.images).map(lambda ln: [float(x) for x in ln.split(',')])
     labels = sc.textFile(args.labels).map(lambda ln: [float(x) for x in ln.split(',')])
     dataRDD = images.zip(labels)
-    if args.mode == 'train':
-      cluster = TFCluster.run(sc, main_fun, args, args.cluster_size, args.num_ps, args.tensorboard, TFCluster.InputMode.SPARK, log_dir=args.model_dir, master_node='master')
-      cluster.train(dataRDD, args.epochs)
-      cluster.shutdown()
-    else:
-      # Note: using "parallel" inferencing, not "cluster"
-      # each node loads the model and runs independently of others
-      cluster = TFCluster.run(sc, main_fun, args, args.cluster_size, 0, args.tensorboard, TFCluster.InputMode.SPARK, log_dir=args.model_dir)
-      resultRDD = cluster.inference(dataRDD)
-      resultRDD.saveAsTextFile(args.output)
-      cluster.shutdown()
+    cluster = TFCluster.run(sc, main_fun, args, args.cluster_size, args.num_ps, args.tensorboard, TFCluster.InputMode.SPARK, log_dir=args.model_dir, master_node='master')
+    cluster.train(dataRDD, args.epochs)
+    cluster.shutdown()
